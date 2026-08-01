@@ -1,0 +1,10 @@
+{
+  "id": "import-doctor",
+  "name": "Import Doctor",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Audit Notion imports for broken links, missing attachments, UUID filenames, duplicate titles, malformed properties, and HTML leftovers.",
+  "author": "iavil",
+  "authorUrl": "https://github.com/israerusan",
+  "isDesktopOnly": false
+}

@@ -1,0 +1,24 @@
+{
+  "name": "obsidian-import-doctor",
+  "version": "0.1.0",
+  "description": "Audit and safely repair Notion imports in Obsidian.",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "npm run typecheck && node --test tests/*.test.mjs"
+  },
+  "author": "iavil",
+  "license": "MIT",
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.1",
+    "obsidian": "1.7.2",
+    "typescript": "^5.8.3"
+  }
+}

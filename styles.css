@@ -1,0 +1,5 @@
+.import-doctor-report { max-width: 760px; }
+.import-doctor-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin: 16px 0; }
+.import-doctor-summary > div { background: var(--background-secondary); border-radius: var(--radius-s); padding: 10px 12px; }
+.import-doctor-issues { max-height: 50vh; overflow: auto; padding-inline-start: 22px; }
+.import-doctor-issues li { margin-bottom: 8px; }
