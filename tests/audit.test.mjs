@@ -90,3 +90,12 @@ test("trusts the supplied YAML validator for valid quoted keys", () => {
   const report = auditImport([{ path: "Import/Home.md", basename: "Home", extension: "md", content: "---\n\"Notion ID\": abc\n---\n" }], { selectedRoot: "Import", validateFrontmatter: () => true });
   assert.equal(report.counts["malformed-properties"], 0);
 });
+
+test("caps retained findings while preserving exact totals", () => {
+  const content = Array.from({ length: 1000 }, (_, index) => `[[Missing ${index}]]`).join("\n");
+  const report = auditImport([{ path: "Import/Home.md", basename: "Home", extension: "md", content }], { selectedRoot: "Import", maxDetailedIssues: 25 });
+  assert.equal(report.issues.length, 25);
+  assert.equal(report.totalIssues, 1000);
+  assert.equal(report.counts["broken-link"], 1000);
+  assert.equal(report.truncated, true);
+});

@@ -6,6 +6,10 @@ Find potential broken links, missing files, leftover Notion IDs, and formatting 
 
 Choose your imported folder in Settings → Import Doctor, then run **Scan Notion import** from the Command Palette. Review the report; no files are changed.
 
+## Requirements
+
+Requires Obsidian 1.5.0 or later on desktop. Mobile is not currently supported.
+
 ## Current scope
 
 This preview supports folders created by Obsidian’s official Notion importer only. Import Doctor reads Markdown notes in the selected folder and indexes other files there to check whether referenced files exist.
@@ -24,6 +28,8 @@ Each scan checks for:
 
 Detection is heuristic and may report false positives or miss unsupported patterns. Reports list the first 250 findings and show counts for all findings detected in the scan.
 
+The preview limits a scan to 10,000 Markdown notes, 150 MB total, and 10 MB per note. Split larger imports into smaller folders. Only one scan runs at a time, and it can be cancelled from the Command Palette.
+
 ## Pro status
 
 Batch repair is in development and is not currently sold. Pro is planned to add reviewed batch repairs, filename-conflict handling, a change log, and recovery tools. Features may change before release.
@@ -40,4 +46,10 @@ npm test
 npm run build
 ```
 
-For manual installation, copy `main.js`, `manifest.json`, and `styles.css` into `.obsidian/plugins/import-doctor/`.
+## Manual installation
+
+Run `npm install && npm run build`, then copy `main.js`, `manifest.json`, and `styles.css` into `<vault>/.obsidian/plugins/import-doctor/`. The repository also includes the latest reviewed `main.js` artifact.
+
+## Support and feedback
+
+Report bugs, scan failures, or false positives in [GitHub Issues](https://github.com/israerusan/import-Doctor/issues). Include the Import Doctor version and Obsidian version. Do not attach private note contents; use a minimal redacted example.

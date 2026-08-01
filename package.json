@@ -12,9 +12,7 @@
   },
   "author": "iavil",
   "license": "MIT",
-  "dependencies": {
-    "tweetnacl": "^1.0.3"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "^24.0.0",
     "esbuild": "^0.28.1",

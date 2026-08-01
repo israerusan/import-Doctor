@@ -2,9 +2,9 @@ export type IssueKind = "broken-link" | "ambiguous-link" | "missing-attachment" 
 
 export interface AuditFile { path: string; basename: string; extension: string; content?: string }
 export interface AuditIssue { kind: IssueKind; path: string; message: string; target?: string; line?: number }
-export interface AuditReport { scannedFiles: number; issues: AuditIssue[]; counts: Record<IssueKind, number> }
+export interface AuditReport { scannedFiles: number; issues: AuditIssue[]; counts: Record<IssueKind, number>; totalIssues: number; truncated: boolean }
 export type WikiResolution = { status: "resolved"; path: string } | { status: "outside"; path: string } | { status: "unresolved" };
-export interface AuditOptions { selectedRoot?: string; resolveWikiLink?: (target: string, sourcePath: string) => WikiResolution; validateFrontmatter?: (yaml: string) => boolean }
+export interface AuditOptions { selectedRoot?: string; resolveWikiLink?: (target: string, sourcePath: string) => WikiResolution; validateFrontmatter?: (yaml: string) => boolean; maxDetailedIssues?: number }
 
 const UUID_SUFFIX = /(?:\s|-)([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const WIKI_LINK = /!?\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]/g;
@@ -13,6 +13,10 @@ const ATTACHMENT_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg
 
 export function auditImport(files: AuditFile[], options: AuditOptions = {}): AuditReport {
   const issues: AuditIssue[] = [];
+  const counts = emptyCounts();
+  let totalIssues = 0;
+  const detailLimit = Math.max(0, options.maxDetailedIssues ?? Number.POSITIVE_INFINITY);
+  const addIssue = (issue: AuditIssue): void => { counts[issue.kind] += 1; totalIssues += 1; if (issues.length < detailLimit) issues.push(issue); };
   const selectedRoot = normalize(options.selectedRoot ?? commonRoot(files.map((file) => file.path)));
   const exactPaths = new Set(files.map((file) => normalize(file.path)));
   const basenameIndex = new Map<string, string[]>();
@@ -32,63 +36,64 @@ export function auditImport(files: AuditFile[], options: AuditOptions = {}): Aud
     const group = collisionGroups.get(collisionKey) ?? [];
     group.push(file);
     collisionGroups.set(collisionKey, group);
-    if (UUID_SUFFIX.test(file.basename)) issues.push({ kind: "uuid-filename", path: file.path, message: "A Notion ID suffix remains in this filename." });
-    inspectContent(file, exactPaths, basenameIndex, issues, options, selectedRoot);
+    if (UUID_SUFFIX.test(file.basename)) addIssue({ kind: "uuid-filename", path: file.path, message: "A Notion ID suffix remains in this filename." });
+    inspectContent(file, exactPaths, basenameIndex, addIssue, options, selectedRoot);
   }
 
   for (const group of collisionGroups.values()) {
     if (group.length < 2) continue;
-    for (const file of group) issues.push({ kind: "duplicate-title", path: file.path, message: `Renaming would collide with ${group.length - 1} note(s) in the same folder.` });
+    for (const file of group) addIssue({ kind: "duplicate-title", path: file.path, message: `Renaming would collide with ${group.length - 1} note(s) in the same folder.` });
   }
 
-  const counts = emptyCounts();
-  for (const issue of issues) counts[issue.kind] += 1;
-  return { scannedFiles: files.length, issues, counts };
+  return { scannedFiles: files.length, issues, counts, totalIssues, truncated: totalIssues > issues.length };
 }
 
-function inspectContent(file: AuditFile, paths: Set<string>, basenames: Map<string, string[]>, issues: AuditIssue[], options: AuditOptions, selectedRoot: string): void {
+type IssueSink = (issue: AuditIssue) => void;
+
+function inspectContent(file: AuditFile, paths: Set<string>, basenames: Map<string, string[]>, addIssue: IssueSink, options: AuditOptions, selectedRoot: string): void {
   const original = file.content ?? "";
-  if (hasMalformedFrontmatter(original, options.validateFrontmatter)) issues.push({ kind: "malformed-properties", path: file.path, message: "The properties block may be malformed or unclosed." });
+  const lineNumberAt = makeLineLocator(original);
+  if (hasMalformedFrontmatter(original, options.validateFrontmatter)) addIssue({ kind: "malformed-properties", path: file.path, message: "The properties block may be malformed or unclosed." });
   const content = maskNonRenderedMarkdown(original);
-  if (HTML_LEFTOVER.test(content)) issues.push({ kind: "html-leftover", path: file.path, message: "HTML that may be leftover from the import was detected." });
+  if (HTML_LEFTOVER.test(content)) addIssue({ kind: "html-leftover", path: file.path, message: "HTML that may be leftover from the import was detected." });
 
   for (const match of content.matchAll(WIKI_LINK)) {
     const target = match[1].trim();
     const resolved = options.resolveWikiLink?.(target, file.path);
-    if (resolved?.status === "outside") { issues.push({ kind: "outside-folder-path", path: file.path, target, line: lineAt(original, match.index ?? 0), message: "This link leaves the selected import folder; review it to confirm that is intentional." }); continue; }
+    if (resolved?.status === "outside") { addIssue({ kind: "outside-folder-path", path: file.path, target, line: lineNumberAt(match.index ?? 0), message: "This link leaves the selected import folder; review it to confirm that is intentional." }); continue; }
     if (resolved?.status === "resolved") continue;
     if (!resolved || resolved.status === "unresolved") {
       const fallback = wikiTargetStatus(target, file.path, paths, basenames);
       if (fallback === "exists") continue;
-      if (fallback === "ambiguous") { issues.push({ kind: "ambiguous-link", path: file.path, target, line: lineAt(original, match.index ?? 0), message: "More than one note could match this unqualified link." }); continue; }
+      if (fallback === "ambiguous") { addIssue({ kind: "ambiguous-link", path: file.path, target, line: lineNumberAt(match.index ?? 0), message: "More than one note could match this unqualified link." }); continue; }
     }
     const wikiKind: IssueKind = ATTACHMENT_EXTENSIONS.has(extensionOf(target)) ? "missing-attachment" : "broken-link";
-    issues.push({ kind: wikiKind, path: file.path, target, line: lineAt(original, match.index ?? 0), message: wikiKind === "missing-attachment" ? "The referenced file was not found in the selected folder." : "The linked note was not found in the selected folder." });
+    addIssue({ kind: wikiKind, path: file.path, target, line: lineNumberAt(match.index ?? 0), message: wikiKind === "missing-attachment" ? "The referenced file was not found in the selected folder." : "The linked note was not found in the selected folder." });
   }
 
-  for (const link of markdownLinks(content)) inspectMarkdownTarget(file.path, original, link.target, link.index, paths, issues, selectedRoot);
+  for (const link of markdownLinks(content)) inspectMarkdownTarget(file.path, link.target, link.index, paths, addIssue, selectedRoot, lineNumberAt);
 }
 
-function inspectMarkdownTarget(sourcePath: string, content: string, rawTarget: string, index: number, paths: Set<string>, issues: AuditIssue[], selectedRoot: string): void {
+function inspectMarkdownTarget(sourcePath: string, rawTarget: string, index: number, paths: Set<string>, addIssue: IssueSink, selectedRoot: string, lineNumberAt: (index: number) => number): void {
   const targetWithoutTitle = stripOptionalTitle(rawTarget.trim());
   const unwrapped = targetWithoutTitle.startsWith("<") && targetWithoutTitle.endsWith(">") ? targetWithoutTitle.slice(1, -1) : targetWithoutTitle;
   const decoded = safeDecode(unwrapped.split("#")[0].split("?")[0]).replace(/\\/g, "/").trim();
   if (!decoded) return;
   if (/^(?:file:|javascript:|[a-z]:\/|\/\/|\\\\)/i.test(decoded)) {
-    issues.push({ kind: "outside-folder-path", path: sourcePath, target: rawTarget, line: lineAt(content, index), message: "This link points outside the selected import folder." });
+    addIssue({ kind: "outside-folder-path", path: sourcePath, target: rawTarget, line: lineNumberAt(index), message: "This link points outside the selected import folder." });
     return;
   }
   if (/^[a-z][a-z0-9+.-]*:/i.test(decoded)) return;
   const resolved = resolveRelative(parentPath(sourcePath), decoded);
   if (resolved.escaped || (selectedRoot && resolved.path !== selectedRoot && !resolved.path.startsWith(`${selectedRoot}/`))) {
-    issues.push({ kind: "outside-folder-path", path: sourcePath, target: rawTarget, line: lineAt(content, index), message: "This link resolves outside the selected import folder." });
+    addIssue({ kind: "outside-folder-path", path: sourcePath, target: rawTarget, line: lineNumberAt(index), message: "This link resolves outside the selected import folder." });
     return;
   }
   const candidate = normalize(resolved.path);
   const exists = paths.has(candidate) || (!extensionOf(candidate) && paths.has(`${candidate}.md`));
   if (exists) return;
   const kind: IssueKind = ATTACHMENT_EXTENSIONS.has(extensionOf(candidate)) ? "missing-attachment" : "broken-link";
-  issues.push({ kind, path: sourcePath, target: rawTarget, line: lineAt(content, index), message: kind === "missing-attachment" ? "The referenced file was not found in the selected folder." : "The linked note was not found in the selected folder." });
+  addIssue({ kind, path: sourcePath, target: rawTarget, line: lineNumberAt(index), message: kind === "missing-attachment" ? "The referenced file was not found in the selected folder." : "The linked note was not found in the selected folder." });
 }
 
 function wikiTargetStatus(target: string, sourcePath: string, paths: Set<string>, basenames: Map<string, string[]>): "exists" | "ambiguous" | "missing" {
@@ -182,5 +187,9 @@ function commonRoot(paths: string[]): string {
 function normalize(path: string): string { return resolveRelative("", path.replace(/\\/g, "/")).path }
 function extensionOf(path: string): string { const name = path.slice(path.lastIndexOf("/") + 1); return name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "" }
 function safeDecode(value: string): string { try { return decodeURIComponent(value); } catch { return value } }
-function lineAt(content: string, index: number): number { return content.slice(0, index).split(/\r?\n/).length }
+function makeLineLocator(content: string): (index: number) => number {
+  const starts = [0];
+  for (let i = 0; i < content.length; i++) if (content.charCodeAt(i) === 10) starts.push(i + 1);
+  return (index: number): number => { let low = 0; let high = starts.length; while (low < high) { const mid = (low + high) >>> 1; if (starts[mid] <= index) low = mid + 1; else high = mid; } return low; };
+}
 function emptyCounts(): Record<IssueKind, number> { return { "broken-link": 0, "ambiguous-link": 0, "missing-attachment": 0, "uuid-filename": 0, "duplicate-title": 0, "malformed-properties": 0, "html-leftover": 0, "outside-folder-path": 0 } }
