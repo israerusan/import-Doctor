@@ -5,8 +5,11 @@ interface ImportDoctorSettings { importFolder: string }
 
 const DEFAULT_SETTINGS: ImportDoctorSettings = { importFolder: "" };
 const MAX_MARKDOWN_FILES = 10_000;
+const MAX_INDEXED_FILES = 50_000;
+const MAX_PATH_CHARACTERS = 5_000_000;
 const MAX_IMPORT_BYTES = 100 * 1024 * 1024;
 const MAX_NOTE_BYTES = 2 * 1024 * 1024;
+const MAX_FRONTMATTER_CHARACTERS = 256 * 1024;
 
 export default class ImportDoctorPlugin extends Plugin {
   settings: ImportDoctorSettings = { ...DEFAULT_SETTINGS };
@@ -34,10 +37,11 @@ export default class ImportDoctorPlugin extends Plugin {
       return;
     }
     const markdownCount = files.filter((file) => file.extension.toLowerCase() === "md").length;
+    const pathCharacters = files.reduce((sum, file) => sum + file.path.length, 0);
     const totalBytes = files.filter((file) => file.extension.toLowerCase() === "md").reduce((sum, file) => sum + file.stat.size, 0);
     const oversizedNote = files.find((file) => file.extension.toLowerCase() === "md" && file.stat.size > MAX_NOTE_BYTES);
-    if (markdownCount > MAX_MARKDOWN_FILES || totalBytes > MAX_IMPORT_BYTES || oversizedNote) {
-      new Notice(`This preview limits scans to ${MAX_MARKDOWN_FILES.toLocaleString()} Markdown notes, 100 MB of Markdown, and 2 MB per note. Split the import into smaller folders.`);
+    if (files.length > MAX_INDEXED_FILES || pathCharacters > MAX_PATH_CHARACTERS || markdownCount > MAX_MARKDOWN_FILES || totalBytes > MAX_IMPORT_BYTES || oversizedNote) {
+      new Notice(`This preview limits scans to ${MAX_INDEXED_FILES.toLocaleString()} indexed files, ${MAX_MARKDOWN_FILES.toLocaleString()} Markdown notes, 100 MB of Markdown, and 2 MB per note. Split the import into smaller folders.`);
       return;
     }
     this.scanning = true;
@@ -45,7 +49,7 @@ export default class ImportDoctorPlugin extends Plugin {
     const inventory: AuditFile[] = files.map((file) => ({ path: file.path, basename: file.basename, extension: file.extension }));
     const selected = new Set(files.map((file) => file.path));
     const auditIndex = createAuditIndex(inventory, root);
-    const aggregate = auditImport([], { index: auditIndex, inspectContent: false, maxDetailedIssues: 250 });
+    const aggregate = auditImport([], { index: auditIndex, inspectContent: false, maxDetailedIssues: 250, maxDetailsPerKind: 32 });
     const skippedPaths: string[] = [];
     let actualContentUnits = 0;
     try {
@@ -54,17 +58,21 @@ export default class ImportDoctorPlugin extends Plugin {
         if (generation !== this.scanGeneration) { new Notice("Import Doctor scan cancelled."); return; }
         const file = files[index];
         if (file.extension.toLowerCase() !== "md") continue;
+        let content: string;
+        try { content = await this.app.vault.read(file); }
+        catch { skippedPaths.push(file.path); await yieldToUi(); continue; }
+        if (generation !== this.scanGeneration) { new Notice("Import Doctor scan cancelled."); return; }
+        const actualBytes = new TextEncoder().encode(content).byteLength;
+        actualContentUnits += actualBytes;
+        if (actualBytes > MAX_NOTE_BYTES || actualContentUnits > MAX_IMPORT_BYTES) {
+          new Notice("The Markdown content grew beyond this preview’s byte limit during scanning. Split the import into smaller folders.");
+          return;
+        }
         try {
-          const content = await this.app.vault.cachedRead(file);
-          actualContentUnits += content.length;
-          if (content.length > MAX_NOTE_BYTES / 2 || actualContentUnits > MAX_IMPORT_BYTES / 2) {
-            new Notice("The notes grew beyond this preview’s in-memory safety limit during scanning. Split the import into smaller folders.");
-            return;
-          }
           const detailBudget = Math.max(0, 250 - aggregate.issues.length);
           const partial = auditImport([{ path: file.path, basename: file.basename, extension: file.extension, content }], {
-            index: auditIndex, inspectMetadata: false, maxDetailedIssues: detailBudget,
-            validateFrontmatter: (yaml) => { try { parseYaml(yaml); return true; } catch { return false; } },
+            index: auditIndex, inspectMetadata: false, maxDetailedIssues: detailBudget, maxDetailsPerKind: 32,
+            validateFrontmatter: (yaml) => { if (yaml.length > MAX_FRONTMATTER_CHARACTERS) return false; try { parseYaml(yaml); return true; } catch { return false; } },
             resolveWikiLink: (target, source) => {
               const resolved = this.app.metadataCache.getFirstLinkpathDest(target, source);
               if (!resolved) return { status: "unresolved" };
@@ -72,7 +80,7 @@ export default class ImportDoctorPlugin extends Plugin {
             }
           });
           mergeReport(aggregate, partial, 250);
-        } catch { skippedPaths.push(file.path); }
+        } catch (error) { console.error(`Import Doctor failed while auditing ${file.path}`, error); new Notice(`Import Doctor could not complete the scan while auditing ${file.path}.`); return; }
         await yieldToUi();
       }
       if (generation !== this.scanGeneration) return;
@@ -103,7 +111,7 @@ class AuditReportModal extends Modal {
       const item = list.createEl("li");
       item.createEl("strong", { text: `${label(issue.kind)} — ` });
       item.appendText(`${issue.path}${issue.line ? `, line ${issue.line}` : ""}${issue.target ? ` — ${issue.target}` : ""}: ${issue.message}`);
-      const openButton = item.createEl("button", { text: "Open note", attr: { "aria-label": `Open ${issue.path}${issue.line ? ` at line ${issue.line}` : ""}` } });
+      const openButton = item.createEl("button", { text: "Open note", attr: { "aria-label": `Open ${issue.path}` } });
       openButton.addEventListener("click", () => { const file = this.app.vault.getAbstractFileByPath(issue.path); if (file instanceof TFile) void this.app.workspace.getLeaf(false).openFile(file); else new Notice(`Could not open ${issue.path}.`); });
     }
     if (this.report.truncated) contentEl.createEl("p", { text: `Showing the first ${this.report.issues.length} findings. ${this.report.totalIssues - this.report.issues.length} additional findings are included in the totals above.` });
@@ -120,7 +128,7 @@ class ImportDoctorSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "Import Doctor" });
     containerEl.createEl("p", { text: "This preview supports folders created by Obsidian’s official Notion importer only. Scanning is read-only and does not upload note contents." });
-    new Setting(containerEl).setName("Notion import folder").setDesc("Vault-relative path to the imported folder. Markdown notes and referenced files in all subfolders are included. Example: Imports/Notion.").addText((text) => {
+    new Setting(containerEl).setName("Notion import folder").setDesc("Vault-relative path to the imported folder. Limit: 50,000 indexed files, 10,000 Markdown notes, 100 MB of Markdown, and 2 MB per note. Example: Imports/Notion.").addText((text) => {
       text.setPlaceholder("Imports/Notion").setValue(this.plugin.settings.importFolder).onChange((value) => { this.plugin.settings.importFolder = value.trim(); });
       text.inputEl.addEventListener("blur", () => { this.plugin.settings.importFolder = text.getValue().trim(); void this.plugin.saveData({ ...this.plugin.settings }); });
     });
@@ -141,8 +149,15 @@ function mergeReport(target: AuditReport, source: AuditReport, detailLimit: numb
   target.scannedFiles += source.scannedFiles;
   target.totalIssues += source.totalIssues;
   for (const [kind, count] of Object.entries(source.counts)) target.counts[kind as keyof typeof target.counts] += count;
-  const available = Math.max(0, detailLimit - target.issues.length);
-  if (available) target.issues.push(...source.issues.slice(0, available));
+  const retainedByKind = new Map<string, number>();
+  for (const issue of target.issues) retainedByKind.set(issue.kind, (retainedByKind.get(issue.kind) ?? 0) + 1);
+  for (const issue of source.issues) {
+    if (target.issues.length >= detailLimit) break;
+    const retained = retainedByKind.get(issue.kind) ?? 0;
+    if (retained >= 32) continue;
+    target.issues.push(issue);
+    retainedByKind.set(issue.kind, retained + 1);
+  }
   target.truncated = target.totalIssues > target.issues.length;
 }
 

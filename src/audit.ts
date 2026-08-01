@@ -5,7 +5,7 @@ export interface AuditIssue { kind: IssueKind; path: string; message: string; ta
 export interface AuditReport { scannedFiles: number; issues: AuditIssue[]; counts: Record<IssueKind, number>; totalIssues: number; truncated: boolean }
 export type WikiResolution = { status: "resolved"; path: string } | { status: "outside"; path: string } | { status: "unresolved" };
 export interface AuditIndex { files: AuditFile[]; selectedRoot: string; exactPaths: Set<string>; basenameIndex: Map<string, string[]> }
-export interface AuditOptions { selectedRoot?: string; index?: AuditIndex; inspectMetadata?: boolean; inspectContent?: boolean; resolveWikiLink?: (target: string, sourcePath: string) => WikiResolution; validateFrontmatter?: (yaml: string) => boolean; maxDetailedIssues?: number }
+export interface AuditOptions { selectedRoot?: string; index?: AuditIndex; inspectMetadata?: boolean; inspectContent?: boolean; resolveWikiLink?: (target: string, sourcePath: string) => WikiResolution; validateFrontmatter?: (yaml: string) => boolean; maxDetailedIssues?: number; maxDetailsPerKind?: number }
 
 const UUID_SUFFIX = /(?:\s|-)([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const WIKI_LINK = /!?\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]/g;
@@ -24,7 +24,9 @@ export function auditImport(files: AuditFile[], options: AuditOptions = {}): Aud
   const counts = emptyCounts();
   let totalIssues = 0;
   const detailLimit = Math.max(0, options.maxDetailedIssues ?? Number.POSITIVE_INFINITY);
-  const addIssue = (issue: AuditIssue): void => { counts[issue.kind] += 1; totalIssues += 1; if (issues.length < detailLimit) issues.push(issue); };
+  const retainedByKind = emptyCounts();
+  const perKindLimit = Math.max(0, options.maxDetailsPerKind ?? Number.POSITIVE_INFINITY);
+  const addIssue = (issue: AuditIssue): void => { counts[issue.kind] += 1; totalIssues += 1; if (issues.length < detailLimit && retainedByKind[issue.kind] < perKindLimit) { issues.push(issue); retainedByKind[issue.kind] += 1; } };
   const index = options.index ?? createAuditIndex(files, options.selectedRoot);
   const selectedRoot = index.selectedRoot;
   const exactPaths = index.exactPaths;
@@ -141,6 +143,7 @@ function markdownLinks(content: string): Array<{ target: string; index: number }
       if (char === ")" && --depth === 0) break;
     }
     if (depth === 0) { links.push({ target: unescapeMarkdown(content.slice(i + 2, j)), index: opening }); i = j; }
+    else break;
   }
   return links;
 }

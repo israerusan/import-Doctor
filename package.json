@@ -1,6 +1,6 @@
 {
   "name": "obsidian-import-doctor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Scan folders from Obsidian’s Notion importer for broken links, missing files, Notion ID suffixes, title collisions, malformed properties, and leftover HTML.",
   "main": "main.js",
   "type": "module",
@@ -8,10 +8,14 @@
     "build": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",
     "typecheck": "tsc --noEmit -p .",
-    "test": "npm run typecheck && node --test tests/*.test.mjs"
+    "test": "npm run typecheck && node --test tests/*.test.mjs",
+    "verify:release": "npm run build && node tests/release-contract.mjs"
   },
   "author": "iavil",
   "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/israerusan/import-Doctor.git" },
+  "homepage": "https://github.com/israerusan/import-Doctor#readme",
+  "bugs": { "url": "https://github.com/israerusan/import-Doctor/issues" },
   "dependencies": {},
   "devDependencies": {
     "@types/node": "^24.0.0",

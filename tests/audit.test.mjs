@@ -112,3 +112,24 @@ test("supports metadata indexing and one-note-at-a-time content audits", () => {
   assert.equal(content.counts["broken-link"], 1);
   assert.equal(content.counts["uuid-filename"], 0);
 });
+
+test("recovers from unmatched Markdown destinations without rescanning suffixes", () => {
+  const content = "[x](".repeat(50_000);
+  const started = performance.now();
+  const report = auditImport([{ path: "Import/Home.md", basename: "Home", extension: "md", content }], { selectedRoot: "Import", maxDetailedIssues: 25 });
+  assert.equal(report.totalIssues, 0);
+  assert.ok(performance.now() - started < 1000, "unmatched destinations should be processed linearly");
+});
+
+test("balances retained details across issue categories", () => {
+  const report = auditImport(Array.from({ length: 100 }, (_, index) => ({
+    path: `Import/Note ${index} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md`,
+    basename: `Note ${index} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`,
+    extension: "md",
+    content: `[[Missing ${index}]]`
+  })), { selectedRoot: "Import", maxDetailedIssues: 64, maxDetailsPerKind: 16 });
+  assert.equal(report.counts["uuid-filename"], 100);
+  assert.equal(report.counts["broken-link"], 100);
+  assert.equal(report.issues.filter((issue) => issue.kind === "uuid-filename").length, 16);
+  assert.equal(report.issues.filter((issue) => issue.kind === "broken-link").length, 16);
+});
