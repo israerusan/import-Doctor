@@ -14,7 +14,7 @@ Requires Obsidian 1.5.0 or later on desktop. Mobile is not currently supported.
 
 This preview supports folders created by Obsidian’s official Notion importer only. Import Doctor reads Markdown notes in the selected folder and indexes other files there to check whether referenced files exist.
 
-The current scanner is desktop-only while incremental scanning, progress, and cancellation are developed for large mobile vaults.
+Mobile is not supported in this preview. Notes are audited one at a time on desktop, and an active scan can be cancelled from the Command Palette.
 
 Each scan checks for:
 
@@ -28,7 +28,7 @@ Each scan checks for:
 
 Detection is heuristic and may report false positives or miss unsupported patterns. Reports list the first 250 findings and show counts for all findings detected in the scan.
 
-The preview limits a scan to 10,000 Markdown notes, 150 MB total, and 10 MB per note. Split larger imports into smaller folders. Only one scan runs at a time, and it can be cancelled from the Command Palette.
+The preview limits a scan to 10,000 Markdown notes, 100 MB of Markdown content, and 2 MB per note. Split larger imports into smaller folders. Only one scan runs at a time, and it can be cancelled from the Command Palette.
 
 ## Pro status
 

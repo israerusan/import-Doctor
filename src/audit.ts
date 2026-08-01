@@ -4,12 +4,20 @@ export interface AuditFile { path: string; basename: string; extension: string; 
 export interface AuditIssue { kind: IssueKind; path: string; message: string; target?: string; line?: number }
 export interface AuditReport { scannedFiles: number; issues: AuditIssue[]; counts: Record<IssueKind, number>; totalIssues: number; truncated: boolean }
 export type WikiResolution = { status: "resolved"; path: string } | { status: "outside"; path: string } | { status: "unresolved" };
-export interface AuditOptions { selectedRoot?: string; resolveWikiLink?: (target: string, sourcePath: string) => WikiResolution; validateFrontmatter?: (yaml: string) => boolean; maxDetailedIssues?: number }
+export interface AuditIndex { files: AuditFile[]; selectedRoot: string; exactPaths: Set<string>; basenameIndex: Map<string, string[]> }
+export interface AuditOptions { selectedRoot?: string; index?: AuditIndex; inspectMetadata?: boolean; inspectContent?: boolean; resolveWikiLink?: (target: string, sourcePath: string) => WikiResolution; validateFrontmatter?: (yaml: string) => boolean; maxDetailedIssues?: number }
 
 const UUID_SUFFIX = /(?:\s|-)([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const WIKI_LINK = /!?\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]/g;
 const HTML_LEFTOVER = /<(?:div|span|tbody|tr|td|figure|figcaption|mark)\b[^>]*>/i;
 const ATTACHMENT_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "mp3", "mp4", "wav", "mov", "zip", "csv"]);
+
+export function createAuditIndex(files: AuditFile[], selectedRoot = ""): AuditIndex {
+  const exactPaths = new Set(files.map((file) => normalize(file.path)));
+  const basenameIndex = new Map<string, string[]>();
+  for (const file of files) { const values = basenameIndex.get(file.basename) ?? []; values.push(file.path); basenameIndex.set(file.basename, values); }
+  return { files, selectedRoot: normalize(selectedRoot || commonRoot(files.map((file) => file.path))), exactPaths, basenameIndex };
+}
 
 export function auditImport(files: AuditFile[], options: AuditOptions = {}): AuditReport {
   const issues: AuditIssue[] = [];
@@ -17,33 +25,31 @@ export function auditImport(files: AuditFile[], options: AuditOptions = {}): Aud
   let totalIssues = 0;
   const detailLimit = Math.max(0, options.maxDetailedIssues ?? Number.POSITIVE_INFINITY);
   const addIssue = (issue: AuditIssue): void => { counts[issue.kind] += 1; totalIssues += 1; if (issues.length < detailLimit) issues.push(issue); };
-  const selectedRoot = normalize(options.selectedRoot ?? commonRoot(files.map((file) => file.path)));
-  const exactPaths = new Set(files.map((file) => normalize(file.path)));
-  const basenameIndex = new Map<string, string[]>();
-  for (const file of files) {
-    const key = file.basename;
-    const values = basenameIndex.get(key) ?? [];
-    values.push(file.path);
-    basenameIndex.set(key, values);
-  }
+  const index = options.index ?? createAuditIndex(files, options.selectedRoot);
+  const selectedRoot = index.selectedRoot;
+  const exactPaths = index.exactPaths;
+  const basenameIndex = index.basenameIndex;
 
-  const markdown = files.filter((file) => file.extension.toLowerCase() === "md");
+  const markdown = index.files.filter((file) => file.extension.toLowerCase() === "md");
   const collisionGroups = new Map<string, AuditFile[]>();
-  for (const file of markdown) {
-    const cleaned = file.basename.replace(UUID_SUFFIX, "").trim();
-    const directory = parentPath(file.path).toLowerCase();
-    const collisionKey = `${directory}/${cleaned.toLowerCase()}`;
-    const group = collisionGroups.get(collisionKey) ?? [];
-    group.push(file);
-    collisionGroups.set(collisionKey, group);
-    if (UUID_SUFFIX.test(file.basename)) addIssue({ kind: "uuid-filename", path: file.path, message: "A Notion ID suffix remains in this filename." });
-    inspectContent(file, exactPaths, basenameIndex, addIssue, options, selectedRoot);
+  if (options.inspectMetadata !== false) {
+    for (const file of markdown) {
+      const cleaned = file.basename.replace(UUID_SUFFIX, "").trim();
+      const directory = parentPath(file.path).toLowerCase();
+      const collisionKey = `${directory}/${cleaned.toLowerCase()}`;
+      const group = collisionGroups.get(collisionKey) ?? [];
+      group.push(file);
+      collisionGroups.set(collisionKey, group);
+      if (UUID_SUFFIX.test(file.basename)) addIssue({ kind: "uuid-filename", path: file.path, message: "A Notion ID suffix remains in this filename." });
+    }
   }
 
   for (const group of collisionGroups.values()) {
     if (group.length < 2) continue;
     for (const file of group) addIssue({ kind: "duplicate-title", path: file.path, message: `Renaming would collide with ${group.length - 1} note(s) in the same folder.` });
   }
+
+  if (options.inspectContent !== false) for (const file of files) if (file.extension.toLowerCase() === "md" && file.content !== undefined) inspectContent(file, exactPaths, basenameIndex, addIssue, options, selectedRoot);
 
   return { scannedFiles: files.length, issues, counts, totalIssues, truncated: totalIssues > issues.length };
 }
@@ -118,10 +124,14 @@ function wikiTargetStatus(target: string, sourcePath: string, paths: Set<string>
 
 function markdownLinks(content: string): Array<{ target: string; index: number }> {
   const links: Array<{ target: string; index: number }> = [];
+  const brackets: number[] = [];
   for (let i = 0; i < content.length; i++) {
-    if (content[i] !== "]" || content[i + 1] !== "(" || isEscaped(content, i)) continue;
-    const opening = findOpeningBracket(content, i);
-    if (opening < 0) continue;
+    if (content[i] === "\\") { i += 1; continue; }
+    if (content[i] === "\n") { brackets.length = 0; continue; }
+    if (content[i] === "[") { brackets.push(i); continue; }
+    if (content[i] !== "]" || brackets.length === 0) continue;
+    const opening = brackets.pop() as number;
+    if (content[i + 1] !== "(") continue;
     let depth = 1; let escaped = false; let j = i + 2;
     for (; j < content.length; j++) {
       const char = content[j];
@@ -170,8 +180,6 @@ function resolveRelative(base: string, target: string): { path: string; escaped:
   return { path: parts.join("/"), escaped };
 }
 function parentPath(path: string): string { return path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "" }
-function findOpeningBracket(content: string, close: number): number { let depth = 0; for (let i = close - 1; i >= 0 && content[i] !== "\n"; i--) { if (isEscaped(content, i)) continue; if (content[i] === "]") depth += 1; if (content[i] === "[") { if (depth === 0) return i; depth -= 1; } } return -1 }
-function isEscaped(content: string, index: number): boolean { let slashes = 0; for (let i = index - 1; i >= 0 && content[i] === "\\"; i--) slashes += 1; return slashes % 2 === 1 }
 function unescapeMarkdown(value: string): string { return value.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, "$1") }
 function commonRoot(paths: string[]): string {
   if (!paths.length) return "";

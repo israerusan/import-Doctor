@@ -1,12 +1,12 @@
-import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, parseYaml } from "obsidian";
-import { auditImport, type AuditFile, type AuditReport } from "./audit";
+import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, parseYaml } from "obsidian";
+import { auditImport, createAuditIndex, type AuditFile, type AuditReport } from "./audit";
 
 interface ImportDoctorSettings { importFolder: string }
 
 const DEFAULT_SETTINGS: ImportDoctorSettings = { importFolder: "" };
 const MAX_MARKDOWN_FILES = 10_000;
-const MAX_IMPORT_BYTES = 150 * 1024 * 1024;
-const MAX_NOTE_BYTES = 10 * 1024 * 1024;
+const MAX_IMPORT_BYTES = 100 * 1024 * 1024;
+const MAX_NOTE_BYTES = 2 * 1024 * 1024;
 
 export default class ImportDoctorPlugin extends Plugin {
   settings: ImportDoctorSettings = { ...DEFAULT_SETTINGS };
@@ -34,49 +34,65 @@ export default class ImportDoctorPlugin extends Plugin {
       return;
     }
     const markdownCount = files.filter((file) => file.extension.toLowerCase() === "md").length;
-    const totalBytes = files.reduce((sum, file) => sum + file.stat.size, 0);
+    const totalBytes = files.filter((file) => file.extension.toLowerCase() === "md").reduce((sum, file) => sum + file.stat.size, 0);
     const oversizedNote = files.find((file) => file.extension.toLowerCase() === "md" && file.stat.size > MAX_NOTE_BYTES);
     if (markdownCount > MAX_MARKDOWN_FILES || totalBytes > MAX_IMPORT_BYTES || oversizedNote) {
-      new Notice(`This preview limits scans to ${MAX_MARKDOWN_FILES.toLocaleString()} Markdown notes, 150 MB total, and 10 MB per note. Split the import into smaller folders.`);
+      new Notice(`This preview limits scans to ${MAX_MARKDOWN_FILES.toLocaleString()} Markdown notes, 100 MB of Markdown, and 2 MB per note. Split the import into smaller folders.`);
       return;
     }
     this.scanning = true;
     const generation = ++this.scanGeneration;
-    const inputs: AuditFile[] = [];
-    let skipped = 0;
+    const inventory: AuditFile[] = files.map((file) => ({ path: file.path, basename: file.basename, extension: file.extension }));
+    const selected = new Set(files.map((file) => file.path));
+    const auditIndex = createAuditIndex(inventory, root);
+    const aggregate = auditImport([], { index: auditIndex, inspectContent: false, maxDetailedIssues: 250 });
+    const skippedPaths: string[] = [];
+    let actualContentUnits = 0;
     try {
-      new Notice(`Scanning ${markdownCount.toLocaleString()} Markdown notes…`);
+      new Notice(`Scanning ${markdownCount.toLocaleString()} Markdown notes… Run “Cancel active Notion import scan” from the Command Palette to stop.`);
       for (let index = 0; index < files.length; index++) {
         if (generation !== this.scanGeneration) { new Notice("Import Doctor scan cancelled."); return; }
         const file = files[index];
-        try { inputs.push({ path: file.path, basename: file.basename, extension: file.extension, content: file.extension.toLowerCase() === "md" ? await this.app.vault.cachedRead(file) : undefined }); }
-        catch { skipped += 1; inputs.push({ path: file.path, basename: file.basename, extension: file.extension }); }
-        if (index % 25 === 24) await yieldToUi();
+        if (file.extension.toLowerCase() !== "md") continue;
+        try {
+          const content = await this.app.vault.cachedRead(file);
+          actualContentUnits += content.length;
+          if (content.length > MAX_NOTE_BYTES / 2 || actualContentUnits > MAX_IMPORT_BYTES / 2) {
+            new Notice("The notes grew beyond this preview’s in-memory safety limit during scanning. Split the import into smaller folders.");
+            return;
+          }
+          const detailBudget = Math.max(0, 250 - aggregate.issues.length);
+          const partial = auditImport([{ path: file.path, basename: file.basename, extension: file.extension, content }], {
+            index: auditIndex, inspectMetadata: false, maxDetailedIssues: detailBudget,
+            validateFrontmatter: (yaml) => { try { parseYaml(yaml); return true; } catch { return false; } },
+            resolveWikiLink: (target, source) => {
+              const resolved = this.app.metadataCache.getFirstLinkpathDest(target, source);
+              if (!resolved) return { status: "unresolved" };
+              return selected.has(resolved.path) ? { status: "resolved", path: resolved.path } : { status: "outside", path: resolved.path };
+            }
+          });
+          mergeReport(aggregate, partial, 250);
+        } catch { skippedPaths.push(file.path); }
+        await yieldToUi();
       }
-      const selected = new Set(files.map((file) => file.path));
-      const report = auditImport(inputs, { selectedRoot: root, maxDetailedIssues: 250, validateFrontmatter: (yaml) => { try { parseYaml(yaml); return true; } catch { return false; } }, resolveWikiLink: (target, source) => {
-        const resolved = this.app.metadataCache.getFirstLinkpathDest(target, source);
-        if (!resolved) return { status: "unresolved" };
-        return selected.has(resolved.path) ? { status: "resolved", path: resolved.path } : { status: "outside", path: resolved.path };
-      }});
       if (generation !== this.scanGeneration) return;
-      new AuditReportModal(this.app, report, skipped, markdownCount, files.length).open();
-    } finally { if (generation === this.scanGeneration) this.scanning = false; }
+      new AuditReportModal(this.app, aggregate, skippedPaths, markdownCount, files.length).open();
+    } finally { this.scanning = false; }
   }
 
-  cancelScan(): void { if (this.scanning) { this.scanGeneration += 1; this.scanning = false; } else new Notice("No Import Doctor scan is running."); }
+  cancelScan(): void { if (this.scanning) { this.scanGeneration += 1; new Notice("Cancelling Import Doctor scan…"); } else new Notice("No Import Doctor scan is running."); }
   onunload(): void { this.scanGeneration += 1; this.scanning = false; }
 }
 
 class AuditReportModal extends Modal {
-  constructor(app: App, private readonly report: AuditReport, private readonly skipped: number, private readonly markdownCount: number, private readonly indexedFiles: number) { super(app); }
+  constructor(app: App, private readonly report: AuditReport, private readonly skippedPaths: string[], private readonly markdownCount: number, private readonly indexedFiles: number) { super(app); }
 
   onOpen(): void {
     const { contentEl } = this;
     contentEl.addClass("import-doctor-report");
     contentEl.createEl("h2", { text: "Notion import scan report" });
-    contentEl.createEl("p", { text: `${this.markdownCount - this.skipped} Markdown notes checked · ${this.indexedFiles} files indexed · ${this.report.totalIssues} potential issues detected` });
-    if (this.skipped) contentEl.createEl("p", { text: `${this.skipped} file(s) could not be read and were excluded from content checks.` });
+    contentEl.createEl("p", { text: `${this.markdownCount - this.skippedPaths.length} Markdown notes checked · ${this.indexedFiles} files indexed · ${this.report.totalIssues} potential issues detected` });
+    if (this.skippedPaths.length) contentEl.createEl("p", { text: `${this.skippedPaths.length} Markdown note(s) could not be read and were excluded from content checks: ${this.skippedPaths.join(", ")}` });
     const summary = contentEl.createDiv({ cls: "import-doctor-summary" });
     for (const [kind, count] of Object.entries(this.report.counts)) {
       if (count > 0) summary.createDiv({ text: `${label(kind)}: ${count}` });
@@ -87,8 +103,12 @@ class AuditReportModal extends Modal {
       const item = list.createEl("li");
       item.createEl("strong", { text: `${label(issue.kind)} — ` });
       item.appendText(`${issue.path}${issue.line ? `, line ${issue.line}` : ""}${issue.target ? ` — ${issue.target}` : ""}: ${issue.message}`);
+      const openButton = item.createEl("button", { text: "Open note", attr: { "aria-label": `Open ${issue.path}${issue.line ? ` at line ${issue.line}` : ""}` } });
+      openButton.addEventListener("click", () => { const file = this.app.vault.getAbstractFileByPath(issue.path); if (file instanceof TFile) void this.app.workspace.getLeaf(false).openFile(file); else new Notice(`Could not open ${issue.path}.`); });
     }
     if (this.report.truncated) contentEl.createEl("p", { text: `Showing the first ${this.report.issues.length} findings. ${this.report.totalIssues - this.report.issues.length} additional findings are included in the totals above.` });
+    const copyButton = contentEl.createEl("button", { text: "Copy report" });
+    copyButton.addEventListener("click", () => { void navigator.clipboard.writeText(formatReport(this.report, this.skippedPaths)).then(() => new Notice("Import Doctor report copied."), () => new Notice("Could not copy the report.")); });
     if (this.report.totalIssues > 0) contentEl.createEl("p", { text: "Review each finding before changing files; links outside the import folder may be intentional." });
   }
 }
@@ -116,3 +136,22 @@ function normalizeFolder(value: string): string {
 }
 
 function yieldToUi(): Promise<void> { return new Promise((resolve) => window.setTimeout(resolve, 0)); }
+
+function mergeReport(target: AuditReport, source: AuditReport, detailLimit: number): void {
+  target.scannedFiles += source.scannedFiles;
+  target.totalIssues += source.totalIssues;
+  for (const [kind, count] of Object.entries(source.counts)) target.counts[kind as keyof typeof target.counts] += count;
+  const available = Math.max(0, detailLimit - target.issues.length);
+  if (available) target.issues.push(...source.issues.slice(0, available));
+  target.truncated = target.totalIssues > target.issues.length;
+}
+
+function formatReport(report: AuditReport, skippedPaths: string[]): string {
+  const lines = ["# Import Doctor scan report", "", `Potential issues: ${report.totalIssues}`];
+  for (const [kind, count] of Object.entries(report.counts)) if (count) lines.push(`${label(kind)}: ${count}`);
+  if (skippedPaths.length) lines.push("", `Unreadable Markdown notes: ${skippedPaths.join(", ")}`);
+  lines.push("");
+  for (const issue of report.issues) lines.push(`- ${label(issue.kind)} — ${issue.path}${issue.line ? `, line ${issue.line}` : ""}${issue.target ? ` — ${issue.target}` : ""}: ${issue.message}`);
+  if (report.truncated) lines.push(`- … ${report.totalIssues - report.issues.length} additional findings are included only in the totals.`);
+  return lines.join("\n");
+}

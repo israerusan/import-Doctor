@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { auditImport } from "../src/audit.ts";
+import { auditImport, createAuditIndex } from "../src/audit.ts";
 
 test("detects common Notion import damage", () => {
   const report = auditImport([
@@ -98,4 +98,17 @@ test("caps retained findings while preserving exact totals", () => {
   assert.equal(report.totalIssues, 1000);
   assert.equal(report.counts["broken-link"], 1000);
   assert.equal(report.truncated, true);
+});
+
+test("supports metadata indexing and one-note-at-a-time content audits", () => {
+  const inventory = [
+    { path: "Import/Home aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md", basename: "Home aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", extension: "md" },
+    { path: "Import/Child.md", basename: "Child", extension: "md" }
+  ];
+  const index = createAuditIndex(inventory, "Import");
+  const metadata = auditImport([], { index, inspectContent: false });
+  const content = auditImport([{ ...inventory[0], content: "[[Child]]\n[[Missing]]" }], { index, inspectMetadata: false });
+  assert.equal(metadata.counts["uuid-filename"], 1);
+  assert.equal(content.counts["broken-link"], 1);
+  assert.equal(content.counts["uuid-filename"], 0);
 });
