@@ -1,61 +1,44 @@
-export type IssueKind =
-  | "broken-link"
-  | "missing-attachment"
-  | "uuid-filename"
-  | "duplicate-title"
-  | "malformed-properties"
-  | "html-leftover"
-  | "suspicious-path";
+export type IssueKind = "broken-link" | "ambiguous-link" | "missing-attachment" | "uuid-filename" | "duplicate-title" | "malformed-properties" | "html-leftover" | "outside-folder-path";
 
-export interface AuditFile {
-  path: string;
-  basename: string;
-  extension: string;
-  content?: string;
-}
-
-export interface AuditIssue {
-  kind: IssueKind;
-  path: string;
-  message: string;
-  target?: string;
-  line?: number;
-}
-
-export interface AuditReport {
-  scannedFiles: number;
-  issues: AuditIssue[];
-  counts: Record<IssueKind, number>;
-}
+export interface AuditFile { path: string; basename: string; extension: string; content?: string }
+export interface AuditIssue { kind: IssueKind; path: string; message: string; target?: string; line?: number }
+export interface AuditReport { scannedFiles: number; issues: AuditIssue[]; counts: Record<IssueKind, number> }
+export type WikiResolution = { status: "resolved"; path: string } | { status: "outside"; path: string } | { status: "unresolved" };
+export interface AuditOptions { selectedRoot?: string; resolveWikiLink?: (target: string, sourcePath: string) => WikiResolution; validateFrontmatter?: (yaml: string) => boolean }
 
 const UUID_SUFFIX = /(?:\s|-)([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const WIKI_LINK = /!?\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]/g;
-const MARKDOWN_LINK = /!?\[[^\]]*\]\(([^)]+)\)/g;
-const HTML_LEFTOVER = /<(?:div|span|table|tbody|tr|td|details|summary|figure|figcaption|mark)\b[^>]*>/i;
-const ATTACHMENT_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "mp3", "mp4", "wav", "mov"]);
+const HTML_LEFTOVER = /<(?:div|span|tbody|tr|td|figure|figcaption|mark)\b[^>]*>/i;
+const ATTACHMENT_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "mp3", "mp4", "wav", "mov", "zip", "csv"]);
 
-export function auditImport(files: AuditFile[]): AuditReport {
+export function auditImport(files: AuditFile[], options: AuditOptions = {}): AuditReport {
   const issues: AuditIssue[] = [];
-  const paths = new Set(files.map((file) => normalize(file.path)));
-  const markdown = files.filter((file) => file.extension.toLowerCase() === "md");
-  const titleGroups = new Map<string, AuditFile[]>();
-
-  for (const file of markdown) {
-    const cleanTitle = file.basename.replace(UUID_SUFFIX, "").trim().toLowerCase();
-    const group = titleGroups.get(cleanTitle) ?? [];
-    group.push(file);
-    titleGroups.set(cleanTitle, group);
-    if (UUID_SUFFIX.test(file.basename)) {
-      issues.push({ kind: "uuid-filename", path: file.path, message: "Notion UUID suffix remains in the filename." });
-    }
-    inspectContent(file, paths, issues);
+  const selectedRoot = normalize(options.selectedRoot ?? commonRoot(files.map((file) => file.path)));
+  const exactPaths = new Set(files.map((file) => normalize(file.path)));
+  const basenameIndex = new Map<string, string[]>();
+  for (const file of files) {
+    const key = file.basename;
+    const values = basenameIndex.get(key) ?? [];
+    values.push(file.path);
+    basenameIndex.set(key, values);
   }
 
-  for (const group of titleGroups.values()) {
+  const markdown = files.filter((file) => file.extension.toLowerCase() === "md");
+  const collisionGroups = new Map<string, AuditFile[]>();
+  for (const file of markdown) {
+    const cleaned = file.basename.replace(UUID_SUFFIX, "").trim();
+    const directory = parentPath(file.path).toLowerCase();
+    const collisionKey = `${directory}/${cleaned.toLowerCase()}`;
+    const group = collisionGroups.get(collisionKey) ?? [];
+    group.push(file);
+    collisionGroups.set(collisionKey, group);
+    if (UUID_SUFFIX.test(file.basename)) issues.push({ kind: "uuid-filename", path: file.path, message: "A Notion ID suffix remains in this filename." });
+    inspectContent(file, exactPaths, basenameIndex, issues, options, selectedRoot);
+  }
+
+  for (const group of collisionGroups.values()) {
     if (group.length < 2) continue;
-    for (const file of group) {
-      issues.push({ kind: "duplicate-title", path: file.path, message: `Title collides with ${group.length - 1} other imported note(s).` });
-    }
+    for (const file of group) issues.push({ kind: "duplicate-title", path: file.path, message: `Renaming would collide with ${group.length - 1} note(s) in the same folder.` });
   }
 
   const counts = emptyCounts();
@@ -63,63 +46,141 @@ export function auditImport(files: AuditFile[]): AuditReport {
   return { scannedFiles: files.length, issues, counts };
 }
 
-function inspectContent(file: AuditFile, paths: Set<string>, issues: AuditIssue[]): void {
-  const content = file.content ?? "";
-  if (hasMalformedFrontmatter(content)) {
-    issues.push({ kind: "malformed-properties", path: file.path, message: "Frontmatter is unclosed or contains a malformed property line." });
-  }
-  if (HTML_LEFTOVER.test(content)) {
-    issues.push({ kind: "html-leftover", path: file.path, message: "Notion-style HTML remains in the note body." });
+function inspectContent(file: AuditFile, paths: Set<string>, basenames: Map<string, string[]>, issues: AuditIssue[], options: AuditOptions, selectedRoot: string): void {
+  const original = file.content ?? "";
+  if (hasMalformedFrontmatter(original, options.validateFrontmatter)) issues.push({ kind: "malformed-properties", path: file.path, message: "The properties block may be malformed or unclosed." });
+  const content = maskNonRenderedMarkdown(original);
+  if (HTML_LEFTOVER.test(content)) issues.push({ kind: "html-leftover", path: file.path, message: "HTML that may be leftover from the import was detected." });
+
+  for (const match of content.matchAll(WIKI_LINK)) {
+    const target = match[1].trim();
+    const resolved = options.resolveWikiLink?.(target, file.path);
+    if (resolved?.status === "outside") { issues.push({ kind: "outside-folder-path", path: file.path, target, line: lineAt(original, match.index ?? 0), message: "This link leaves the selected import folder; review it to confirm that is intentional." }); continue; }
+    if (resolved?.status === "resolved") continue;
+    if (!resolved || resolved.status === "unresolved") {
+      const fallback = wikiTargetStatus(target, file.path, paths, basenames);
+      if (fallback === "exists") continue;
+      if (fallback === "ambiguous") { issues.push({ kind: "ambiguous-link", path: file.path, target, line: lineAt(original, match.index ?? 0), message: "More than one note could match this unqualified link." }); continue; }
+    }
+    const wikiKind: IssueKind = ATTACHMENT_EXTENSIONS.has(extensionOf(target)) ? "missing-attachment" : "broken-link";
+    issues.push({ kind: wikiKind, path: file.path, target, line: lineAt(original, match.index ?? 0), message: wikiKind === "missing-attachment" ? "The referenced file was not found in the selected folder." : "The linked note was not found in the selected folder." });
   }
 
-  for (const match of content.matchAll(WIKI_LINK)) inspectTarget(file.path, match[1], match.index ?? 0, paths, issues);
-  for (const match of content.matchAll(MARKDOWN_LINK)) inspectTarget(file.path, match[1], match.index ?? 0, paths, issues);
+  for (const link of markdownLinks(content)) inspectMarkdownTarget(file.path, original, link.target, link.index, paths, issues, selectedRoot);
 }
 
-function inspectTarget(sourcePath: string, rawTarget: string, index: number, paths: Set<string>, issues: AuditIssue[]): void {
-  const decoded = safeDecode(rawTarget.split("#")[0].split("?")[0]).replace(/\\/g, "/").trim();
-  if (!decoded || /^(?:https?:|mailto:|obsidian:|data:)/i.test(decoded)) return;
-  if (/^(?:[a-z]:\/|\/)|(?:^|\/)\.\.(?:\/|$)/i.test(decoded)) {
-    issues.push({ kind: "suspicious-path", path: sourcePath, target: rawTarget, line: lineAt(sourcePath, index), message: "Link uses an absolute or parent-traversing path." });
+function inspectMarkdownTarget(sourcePath: string, content: string, rawTarget: string, index: number, paths: Set<string>, issues: AuditIssue[], selectedRoot: string): void {
+  const targetWithoutTitle = stripOptionalTitle(rawTarget.trim());
+  const unwrapped = targetWithoutTitle.startsWith("<") && targetWithoutTitle.endsWith(">") ? targetWithoutTitle.slice(1, -1) : targetWithoutTitle;
+  const decoded = safeDecode(unwrapped.split("#")[0].split("?")[0]).replace(/\\/g, "/").trim();
+  if (!decoded) return;
+  if (/^(?:file:|javascript:|[a-z]:\/|\/\/|\\\\)/i.test(decoded)) {
+    issues.push({ kind: "outside-folder-path", path: sourcePath, target: rawTarget, line: lineAt(content, index), message: "This link points outside the selected import folder." });
     return;
   }
-
-  const sourceDir = sourcePath.includes("/") ? sourcePath.slice(0, sourcePath.lastIndexOf("/") + 1) : "";
-  const target = normalize(sourceDir + decoded);
-  const candidates = decoded.toLowerCase().endsWith(".md") ? [target] : [target, `${target}.md`];
-  const exists = candidates.some((candidate) => paths.has(candidate)) || [...paths].some((path) => path.endsWith(`/${normalize(decoded)}`));
+  if (/^[a-z][a-z0-9+.-]*:/i.test(decoded)) return;
+  const resolved = resolveRelative(parentPath(sourcePath), decoded);
+  if (resolved.escaped || (selectedRoot && resolved.path !== selectedRoot && !resolved.path.startsWith(`${selectedRoot}/`))) {
+    issues.push({ kind: "outside-folder-path", path: sourcePath, target: rawTarget, line: lineAt(content, index), message: "This link resolves outside the selected import folder." });
+    return;
+  }
+  const candidate = normalize(resolved.path);
+  const exists = paths.has(candidate) || (!extensionOf(candidate) && paths.has(`${candidate}.md`));
   if (exists) return;
-
-  const extension = decoded.includes(".") ? decoded.slice(decoded.lastIndexOf(".") + 1).toLowerCase() : "";
-  const kind: IssueKind = ATTACHMENT_EXTENSIONS.has(extension) ? "missing-attachment" : "broken-link";
-  issues.push({ kind, path: sourcePath, target: rawTarget, message: kind === "missing-attachment" ? "Referenced attachment was not found." : "Linked note was not found." });
+  const kind: IssueKind = ATTACHMENT_EXTENSIONS.has(extensionOf(candidate)) ? "missing-attachment" : "broken-link";
+  issues.push({ kind, path: sourcePath, target: rawTarget, line: lineAt(content, index), message: kind === "missing-attachment" ? "The referenced file was not found in the selected folder." : "The linked note was not found in the selected folder." });
 }
 
-function hasMalformedFrontmatter(content: string): boolean {
-  if (!content.startsWith("---\n") && !content.startsWith("---\r\n")) return false;
+function wikiTargetStatus(target: string, sourcePath: string, paths: Set<string>, basenames: Map<string, string[]>): "exists" | "ambiguous" | "missing" {
+  const raw = safeDecode(target).replace(/\\/g, "/");
+  const targetExtension = extensionOf(raw);
+  if (targetExtension && targetExtension !== "md") {
+    const relativeFile = normalize(`${parentPath(sourcePath)}/${raw}`);
+    const vaultFile = normalize(raw);
+    if (paths.has(relativeFile) || paths.has(vaultFile)) return "exists";
+    const fileBasename = raw.slice(raw.lastIndexOf("/") + 1, raw.lastIndexOf("."));
+    return (basenames.get(fileBasename) ?? []).some((path) => path.endsWith(`.${targetExtension}`)) ? "exists" : "missing";
+  }
+  const decoded = raw.replace(/\.md$/i, "");
+  const relative = normalize(`${parentPath(sourcePath)}/${decoded}.md`);
+  const vaultPath = normalize(`${decoded}.md`);
+  if (paths.has(relative) || paths.has(vaultPath)) return "exists";
+  const basename = decoded.slice(decoded.lastIndexOf("/") + 1);
+  const matches = (basenames.get(basename) ?? []).filter((path) => path.endsWith(".md"));
+  if (decoded.includes("/")) return "missing";
+  return matches.length > 1 ? "ambiguous" : matches.length === 1 ? "exists" : "missing";
+}
+
+function markdownLinks(content: string): Array<{ target: string; index: number }> {
+  const links: Array<{ target: string; index: number }> = [];
+  for (let i = 0; i < content.length; i++) {
+    if (content[i] !== "]" || content[i + 1] !== "(" || isEscaped(content, i)) continue;
+    const opening = findOpeningBracket(content, i);
+    if (opening < 0) continue;
+    let depth = 1; let escaped = false; let j = i + 2;
+    for (; j < content.length; j++) {
+      const char = content[j];
+      if (escaped) { escaped = false; continue; }
+      if (char === "\\") { escaped = true; continue; }
+      if (char === "(") depth += 1;
+      if (char === ")" && --depth === 0) break;
+    }
+    if (depth === 0) { links.push({ target: unescapeMarkdown(content.slice(i + 2, j)), index: opening }); i = j; }
+  }
+  return links;
+}
+
+function stripOptionalTitle(value: string): string {
+  if (value.startsWith("<")) { const end = value.indexOf(">"); return end >= 0 ? value.slice(0, end + 1) : value; }
+  return value.replace(/\s+(?:"[^"]*"|'[^']*'|\([^)]*\))\s*$/, "");
+}
+
+function maskNonRenderedMarkdown(content: string): string {
+  return content
+    .replace(/^---\r?\n[\s\S]*?\r?\n---\s*(?:\r?\n|$)/, (value) => value.replace(/[^\r\n]/g, " "))
+    .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, (value) => value.replace(/[^\r\n]/g, " "))
+    .replace(/^(?: {4}|\t).*$/gm, (value) => " ".repeat(value.length))
+    .replace(/`[^`\r\n]*`/g, (value) => " ".repeat(value.length))
+    .replace(/<!--[\s\S]*?-->/g, (value) => value.replace(/[^\r\n]/g, " "));
+}
+
+function hasMalformedFrontmatter(content: string, validate?: (yaml: string) => boolean): boolean {
+  if (!/^---\r?\n/.test(content)) return false;
   const lines = content.split(/\r?\n/);
   const closing = lines.slice(1).findIndex((line) => line.trim() === "---");
   if (closing < 0) return true;
-  return lines.slice(1, closing + 1).some((line) => line.trim() && !/^\s|#|[-?]|[^:]+:\s*/.test(line));
+  if (validate) return !validate(lines.slice(1, closing + 1).join("\n"));
+  return lines.slice(1, closing + 1).some((line) => {
+    const trimmed = line.trim();
+    return Boolean(trimmed && !trimmed.startsWith("#") && !trimmed.startsWith("-") && !/^[-\w .]+:\s*/.test(trimmed) && !/^\s/.test(line));
+  });
 }
 
-function normalize(path: string): string {
-  const parts: string[] = [];
-  for (const part of path.replace(/\\/g, "/").split("/")) {
+function resolveRelative(base: string, target: string): { path: string; escaped: boolean } {
+  const parts = base.split("/").filter(Boolean); let escaped = false;
+  for (const part of target.split("/")) {
     if (!part || part === ".") continue;
-    if (part === "..") parts.pop(); else parts.push(part);
+    if (part === "..") { if (parts.length) parts.pop(); else escaped = true; } else parts.push(part);
   }
-  return parts.join("/").toLowerCase();
+  return { path: parts.join("/"), escaped };
 }
-
-function safeDecode(value: string): string {
-  try { return decodeURIComponent(value); } catch { return value; }
+function parentPath(path: string): string { return path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "" }
+function findOpeningBracket(content: string, close: number): number { let depth = 0; for (let i = close - 1; i >= 0 && content[i] !== "\n"; i--) { if (isEscaped(content, i)) continue; if (content[i] === "]") depth += 1; if (content[i] === "[") { if (depth === 0) return i; depth -= 1; } } return -1 }
+function isEscaped(content: string, index: number): boolean { let slashes = 0; for (let i = index - 1; i >= 0 && content[i] === "\\"; i--) slashes += 1; return slashes % 2 === 1 }
+function unescapeMarkdown(value: string): string { return value.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, "$1") }
+function commonRoot(paths: string[]): string {
+  if (!paths.length) return "";
+  const directories = paths.map((path) => parentPath(path).split("/").filter(Boolean));
+  const common: string[] = [];
+  for (let i = 0; i < directories[0].length; i++) {
+    const part = directories[0][i];
+    if (!directories.every((segments) => segments[i] === part)) break;
+    common.push(part);
+  }
+  return common.join("/");
 }
-
-function lineAt(_path: string, _index: number): number | undefined {
-  return undefined;
-}
-
-function emptyCounts(): Record<IssueKind, number> {
-  return { "broken-link": 0, "missing-attachment": 0, "uuid-filename": 0, "duplicate-title": 0, "malformed-properties": 0, "html-leftover": 0, "suspicious-path": 0 };
-}
+function normalize(path: string): string { return resolveRelative("", path.replace(/\\/g, "/")).path }
+function extensionOf(path: string): string { const name = path.slice(path.lastIndexOf("/") + 1); return name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "" }
+function safeDecode(value: string): string { try { return decodeURIComponent(value); } catch { return value } }
+function lineAt(content: string, index: number): number { return content.slice(0, index).split(/\r?\n/).length }
+function emptyCounts(): Record<IssueKind, number> { return { "broken-link": 0, "ambiguous-link": 0, "missing-attachment": 0, "uuid-filename": 0, "duplicate-title": 0, "malformed-properties": 0, "html-leftover": 0, "outside-folder-path": 0 } }

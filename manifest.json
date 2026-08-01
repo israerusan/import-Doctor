@@ -3,8 +3,8 @@
   "name": "Import Doctor",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Audit Notion imports for broken links, missing attachments, UUID filenames, duplicate titles, malformed properties, and HTML leftovers.",
+  "description": "Scan folders from Obsidian’s Notion importer for broken links, missing files, Notion ID suffixes, title collisions, malformed properties, and leftover HTML.",
   "author": "iavil",
   "authorUrl": "https://github.com/israerusan",
-  "isDesktopOnly": false
+  "isDesktopOnly": true
 }

@@ -13,7 +13,33 @@ test("detects common Notion import damage", () => {
   assert.equal(report.counts["missing-attachment"], 1);
   assert.equal(report.counts["malformed-properties"], 1);
   assert.equal(report.counts["html-leftover"], 1);
-  assert.equal(report.counts["suspicious-path"], 1);
+  assert.equal(report.counts["outside-folder-path"], 1);
+});
+
+test("handles cross-folder wikilinks and Markdown destination syntax", () => {
+  const report = auditImport([
+    { path: "Import/A/Home.md", basename: "Home", extension: "md", content: "[[Child]]\n[x](../B/Child.md \"title\")\n![image](<../files/a b.png>)" },
+    { path: "Import/B/Child.md", basename: "Child", extension: "md", content: "" },
+    { path: "Import/files/a b.png", basename: "a b", extension: "png" }
+  ]);
+  assert.equal(report.counts["broken-link"], 0);
+  assert.equal(report.counts["missing-attachment"], 0);
+  assert.equal(report.counts["outside-folder-path"], 0);
+});
+
+test("ignores links and HTML inside non-rendered Markdown", () => {
+  const report = auditImport([{ path: "Import/Code.md", basename: "Code", extension: "md", content: "---\nexample: '[[Missing]]'\n---\n```md\n[[Missing]]\n<div>x</div>\n```\n`[[Also Missing]]`\n<!-- [[Hidden]] -->" }]);
+  assert.equal(report.counts["broken-link"], 0);
+  assert.equal(report.counts["html-leftover"], 0);
+});
+
+test("reports exact line numbers and only same-folder rename collisions", () => {
+  const report = auditImport([
+    { path: "Import/A/Project aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md", basename: "Project aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", extension: "md", content: "first\nsecond\n[[Missing]]" },
+    { path: "Import/B/Project bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md", basename: "Project bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", extension: "md", content: "" }
+  ]);
+  assert.equal(report.counts["duplicate-title"], 0);
+  assert.equal(report.issues.find((issue) => issue.kind === "broken-link")?.line, 3);
 });
 
 test("does not flag links to present files", () => {
@@ -24,4 +50,43 @@ test("does not flag links to present files", () => {
   ]);
   assert.equal(report.counts["broken-link"], 0);
   assert.equal(report.counts["missing-attachment"], 0);
+});
+
+test("uses the configured import root instead of inferring it from files", () => {
+  const report = auditImport([{ path: "Import/A/Home.md", basename: "Home", extension: "md", content: "[x](../missing.md)" }], { selectedRoot: "Import" });
+  assert.equal(report.counts["outside-folder-path"], 0);
+  assert.equal(report.counts["broken-link"], 1);
+});
+
+test("preserves wiki links resolved outside the selected folder", () => {
+  const report = auditImport([
+    { path: "Import/Home.md", basename: "Home", extension: "md", content: "[[Foo]]" },
+    { path: "Import/Foo.md", basename: "Foo", extension: "md", content: "" }
+  ], { selectedRoot: "Import", resolveWikiLink: () => ({ status: "outside", path: "Archive/Foo.md" }) });
+  assert.equal(report.counts["outside-folder-path"], 1);
+  assert.equal(report.counts["broken-link"], 0);
+});
+
+test("flags ambiguous unqualified wiki links and ignores stray link punctuation", () => {
+  const report = auditImport([
+    { path: "Import/Home.md", basename: "Home", extension: "md", content: "](​NotALink.md)\n[[Foo]]" },
+    { path: "Import/A/Foo.md", basename: "Foo", extension: "md", content: "" },
+    { path: "Import/B/Foo.md", basename: "Foo", extension: "md", content: "" }
+  ], { selectedRoot: "Import" });
+  assert.equal(report.counts["ambiguous-link"], 1);
+  assert.equal(report.counts["broken-link"], 0);
+});
+
+test("resolves wiki attachment embeds and classifies missing ones as files", () => {
+  const report = auditImport([
+    { path: "Import/Home.md", basename: "Home", extension: "md", content: "![[files/image.png|300]]\n![[missing.pdf#page=2]]" },
+    { path: "Import/files/image.png", basename: "image", extension: "png" }
+  ], { selectedRoot: "Import" });
+  assert.equal(report.counts["broken-link"], 0);
+  assert.equal(report.counts["missing-attachment"], 1);
+});
+
+test("trusts the supplied YAML validator for valid quoted keys", () => {
+  const report = auditImport([{ path: "Import/Home.md", basename: "Home", extension: "md", content: "---\n\"Notion ID\": abc\n---\n" }], { selectedRoot: "Import", validateFrontmatter: () => true });
+  assert.equal(report.counts["malformed-properties"], 0);
 });

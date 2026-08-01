@@ -1,7 +1,7 @@
 {
   "name": "obsidian-import-doctor",
   "version": "0.1.0",
-  "description": "Audit and safely repair Notion imports in Obsidian.",
+  "description": "Scan folders from Obsidian’s Notion importer for broken links, missing files, Notion ID suffixes, title collisions, malformed properties, and leftover HTML.",
   "main": "main.js",
   "type": "module",
   "scripts": {

@@ -1,6 +1,6 @@
-import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from "obsidian";
+import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, parseYaml } from "obsidian";
 import { auditImport, type AuditFile, type AuditReport } from "./audit";
-import { PURCHASE_URL, verifyImportDoctorLicense } from "./license";
+import { verifyImportDoctorLicense } from "./license";
 
 interface ImportDoctorSettings {
   importFolder: string;
@@ -23,23 +23,30 @@ export default class ImportDoctorPlugin extends Plugin {
   }
 
   async scan(): Promise<void> {
-    const root = this.settings.importFolder.replace(/^\/+|\/+$/g, "");
+    const root = normalizeFolder(this.settings.importFolder);
     if (!root) {
-      new Notice("Choose the imported folder in Import Doctor settings first.");
+      new Notice("Choose your Notion import folder in Settings → Import Doctor, then run the scan again.");
       return;
     }
     const files = this.app.vault.getFiles().filter((file) => file.path === root || file.path.startsWith(`${root}/`));
     if (files.length === 0) {
-      new Notice(`No files found under “${root}”.`);
+      new Notice(`No files were found in “${root}”. Check that the vault-relative folder path is correct.`);
       return;
     }
-    const inputs: AuditFile[] = await Promise.all(files.map(async (file) => ({
-      path: file.path,
-      basename: file.basename,
-      extension: file.extension,
-      content: file.extension.toLowerCase() === "md" ? await this.app.vault.cachedRead(file) : undefined
-    })));
-    new AuditReportModal(this.app, auditImport(inputs), this.settings.isPro).open();
+    const inputs: AuditFile[] = [];
+    let skipped = 0;
+    for (const file of files) {
+      try { inputs.push({ path: file.path, basename: file.basename, extension: file.extension, content: file.extension.toLowerCase() === "md" ? await this.app.vault.cachedRead(file) : undefined }); }
+      catch { skipped += 1; inputs.push({ path: file.path, basename: file.basename, extension: file.extension }); }
+    }
+    const selected = new Set(files.map((file) => file.path));
+    const report = auditImport(inputs, { selectedRoot: root, validateFrontmatter: (yaml) => { try { parseYaml(yaml); return true; } catch { return false; } }, resolveWikiLink: (target, source) => {
+      const resolved = this.app.metadataCache.getFirstLinkpathDest(target, source);
+      if (!resolved) return { status: "unresolved" };
+      return selected.has(resolved.path) ? { status: "resolved", path: resolved.path } : { status: "outside", path: resolved.path };
+    }});
+    if (skipped) new Notice(`${skipped} file(s) changed or could not be read during the scan and were skipped.`);
+    new AuditReportModal(this.app, report).open();
   }
 
   refreshLicense(persist = true): void {
@@ -51,27 +58,26 @@ export default class ImportDoctorPlugin extends Plugin {
 }
 
 class AuditReportModal extends Modal {
-  constructor(app: App, private readonly report: AuditReport, private readonly isPro: boolean) { super(app); }
+  constructor(app: App, private readonly report: AuditReport) { super(app); }
 
   onOpen(): void {
     const { contentEl } = this;
     contentEl.addClass("import-doctor-report");
-    contentEl.createEl("h2", { text: "Notion import health report" });
-    contentEl.createEl("p", { text: `${this.report.scannedFiles} files scanned · ${this.report.issues.length} issues found` });
+    contentEl.createEl("h2", { text: "Notion import scan report" });
+    contentEl.createEl("p", { text: `${this.report.scannedFiles} files scanned · ${this.report.issues.length} potential issues detected` });
     const summary = contentEl.createDiv({ cls: "import-doctor-summary" });
     for (const [kind, count] of Object.entries(this.report.counts)) {
       if (count > 0) summary.createDiv({ text: `${label(kind)}: ${count}` });
     }
-    if (this.report.issues.length === 0) contentEl.createEl("p", { text: "No known Notion import problems found in this folder." });
+    if (this.report.issues.length === 0) contentEl.createEl("p", { text: "No potential issues were detected. The scanner uses pattern matching and may miss unsupported link or formatting patterns." });
     const list = contentEl.createEl("ul", { cls: "import-doctor-issues" });
     for (const issue of this.report.issues.slice(0, 250)) {
       const item = list.createEl("li");
       item.createEl("strong", { text: `${label(issue.kind)} — ` });
-      item.appendText(`${issue.path}: ${issue.message}`);
+      item.appendText(`${issue.path}${issue.line ? `, line ${issue.line}` : ""}${issue.target ? ` — ${issue.target}` : ""}: ${issue.message}`);
     }
-    if (this.report.issues.length > 250) contentEl.createEl("p", { text: `${this.report.issues.length - 250} more issues omitted from this preview.` });
-    const action = contentEl.createEl("button", { text: this.isPro ? "Build repair plan (coming next)" : "Unlock batch repair" });
-    action.addEventListener("click", () => this.isPro ? new Notice("Mutation is intentionally disabled in this scanner-first build.") : window.open(PURCHASE_URL));
+    if (this.report.issues.length > 250) contentEl.createEl("p", { text: `Showing the first 250 findings. ${this.report.issues.length - 250} additional findings are included in the totals above.` });
+    if (this.report.issues.length > 0) contentEl.createEl("p", { text: "Batch repair is in development. This preview does not change files." });
   }
 }
 
@@ -81,17 +87,19 @@ class ImportDoctorSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Import Doctor" });
-    new Setting(containerEl).setName("Imported folder").setDesc("Vault-relative folder created by the official Notion import.").addText((text) => text.setPlaceholder("Notion import").setValue(this.plugin.settings.importFolder).onChange(async (value) => {
-      this.plugin.settings.importFolder = value.trim(); await this.plugin.saveData(this.plugin.settings);
-    }));
-    new Setting(containerEl).setName("Pro license key").setDesc(this.plugin.settings.isPro ? `Active${this.plugin.settings.licenseEmail ? ` for ${this.plugin.settings.licenseEmail}` : ""}.` : "Offline Ed25519 verification; no account or server required.").addText((text) => {
-      text.inputEl.type = "password";
-      text.setValue(this.plugin.settings.licenseKey).onChange((value) => { this.plugin.settings.licenseKey = value.trim(); this.plugin.refreshLicense(); });
+    containerEl.createEl("p", { text: "This preview supports folders created by Obsidian’s official Notion importer only. Scanning is read-only and does not upload note contents." });
+    new Setting(containerEl).setName("Notion import folder").setDesc("Vault-relative path to the imported folder. Markdown notes and referenced files in all subfolders are included. Example: Imports/Notion.").addText((text) => {
+      text.setPlaceholder("Imports/Notion").setValue(this.plugin.settings.importFolder).onChange((value) => { this.plugin.settings.importFolder = value.trim(); });
+      text.inputEl.addEventListener("blur", () => { this.plugin.settings.importFolder = text.getValue().trim(); void this.plugin.saveData({ ...this.plugin.settings }); });
     });
-    new Setting(containerEl).setName("Import Doctor Pro").setDesc("Batch repair, collision handling, previews, transaction log, rollback, and resumable processing.").addButton((button) => button.setButtonText("Purchase Pro").onClick(() => window.open(PURCHASE_URL)));
+    containerEl.createEl("p", { text: "Planned Pro features: reviewed batch repairs, conflict handling, and recovery tools. Features may change before release." });
   }
 }
 
 function label(value: string): string {
-  return value.split("-").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ");
+  return ({ "broken-link": "Broken note link", "ambiguous-link": "Ambiguous note link", "missing-attachment": "Missing file", "uuid-filename": "Notion ID in filename", "duplicate-title": "Filename collision", "malformed-properties": "Possibly malformed properties", "html-leftover": "Possible leftover HTML", "outside-folder-path": "Link outside import folder" } as Record<string, string>)[value] ?? value;
+}
+
+function normalizeFolder(value: string): string {
+  return value.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "/");
 }
